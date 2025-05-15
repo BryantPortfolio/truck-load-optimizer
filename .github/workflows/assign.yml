@@ -1,0 +1,35 @@
+name: Daily Assignment Automation
+
+on:
+  schedule:
+    - cron: '0 13 * * *'  # Runs daily at 1:00 PM UTC
+  workflow_dispatch:
+
+jobs:
+  run-optimizer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run assignment script
+        run: |
+          python assign.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add latest_assignments.csv
+          git commit -m "Automated daily assignment update"
+          git push
