@@ -16,8 +16,8 @@ def main():
 
     # Update history for today's date
     combined = update_assignment_history_csv(date.today())
-    history_path = REPO_ROOT / "assignment_history.csv"
-    print(f"[OK] Updated {history_path} (total {len(combined)} rows)")
+    hist_path = REPO_ROOT / "assignment_history.csv"
+    print(f"[OK] Updated {hist_path} ({len(combined)} total rows)")
 
 if __name__ == "__main__":
     main()
