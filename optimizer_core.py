@@ -149,13 +149,10 @@ def build_latest_assignments_df():
 # -----------------------
 # Multi-load-per-driver per day (History)
 # -----------------------
-def build_daily_assignment_history(
-    assigned_date: date,
-    completion_lag_days: int = 1
-) -> pd.DataFrame:
+def build_daily_assignment_history(assigned_Date: date) -> pd.DataFrame:
     """
-    Creates many assignments per driver for a single day while enforcing 11-hour daily drive limit.
-    Strategy: for each driver, repeatedly pick the best eligible load until hours are used up.
+    Creates multiple assignments per driver per day while enforcing the 11-hour rule.
+    Loads are completed same-day if hours fit, otherwise completed next day.
     """
 
     records = []
@@ -165,50 +162,56 @@ def build_daily_assignment_history(
         hours_used = 0.0
 
         while True:
-            # Filter loads that still fit in the remaining hours
-            remaining["DriveHours"] = remaining["Miles"].apply(miles_to_hours)
-            eligible = remaining[(remaining["DriveHours"].notna()) &
-                                ((hours_used + remaining["DriveHours"]) <= MAX_DAILY_DRIVE_HOURS)].copy()
+            remaining["DriverHours"] = remaining["Miles"].apply(miles_to_hours)
 
+            # Only consider loads that could possibly fit in a day
+            eligible = remaining[remaining["DriverHours"] <= MAX_DAILY_DRIVE_HOURS].copy()
             if eligible.empty:
                 break
 
             target_coords = city_coords.get(driver["TargetCity"])
             if target_coords:
                 eligible["DistanceToTarget"] = eligible["Destination"].map(
-                    lambda d: haversine(city_coords.get(d, (0, 0)), target_coords)
+                    lambda d: haversine(city_coords.get(d, (0,0)), target_coords)
                 )
             else:
                 eligible["DistanceToTarget"] = 999999
 
-            # Choose the best load (high payout, closer to target)
+            # Pcik best load
             best = eligible.sort_values(
                 by=["Payout", "DistanceToTarget"],
                 ascending=[False, True]
             ).iloc[0]
 
+            driver_hours = float(best["DriverHours"])
+
+            # Determine completion day
+            if hours_used + driver_hours <= MAX_DAILY_DRIVE_HOURS:
+                completed_date = assigned_Date
+                hours_used += driver_hours
+            else:
+                completed_date = assigned_Date + timedelta(days=1)
+                hours_used = driver_hours # starts next day fresh
+
             pick_lat, pick_lon = coords_lat_lon(best["Origin"].strip())
             drop_lat, drop_lon = coords_lat_lon(best["Destination"].strip())
 
-            drive_hours = float(best["DriveHours"])
-            hours_used += drive_hours
-
-            payout = float(best["Payout"])
             miles = float(best["Miles"])
+            payout = float(best["Payout"])
             mpg = 6
             fuel_price = 4
             fuel_cost = (miles / mpg) * fuel_price
             net_profit = payout - fuel_cost
 
             records.append({
-                "AssignedDate": assigned_date.isoformat(),
-                "CompletedDate": (assigned_date + timedelta(days=completion_lag_days)).isoformat(),
+                "AssignedDate": assigned_Date.isoformat(),
+                "CompletedDate": completed_date.isoformat(),
                 "DriverID": int(driver["DriverID"]),
                 "LoadID": int(best["LoadID"]),
                 "OriginCity": best["Origin"],
                 "DestinationCity": best["Destination"],
                 "Miles": miles,
-                "DriveHours": drive_hours,
+                "DriverHours": drive_hours,
                 "Payout": payout,
                 "FuelCost": fuel_cost,
                 "NetProfit": net_profit,
@@ -217,10 +220,9 @@ def build_daily_assignment_history(
                 "DropoffLat": drop_lat,
                 "DropoffLon": drop_lon,
                 "DailyHoursUsed": round(hours_used, 2),
-                "DailyHoursRemaining": round(MAX_DAILY_DRIVE_HOURS - hours_used, 2),
+                "RemainingHours": round(MAX_DAILY_DRIVE_HOURS - min(hours_used, MAX_DAILY_DRIVE_HOURS), 2),
             })
 
-            # Remove assigned load
             remaining = remaining[remaining["LoadID"] != best["LoadID"]]
 
     return pd.DataFrame(records)
