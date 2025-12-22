@@ -5,8 +5,10 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 10 * * *"  # Runs daily at 10:00 UTC (~5:00 AM ET depending on DST)
+    - cron: "0 10 * * *"  # daily at 10:00 UTC (your comment says 5 AM ET—adjust if you want)
   workflow_dispatch:
+  push:
+    branches: ["main"]
 
 jobs:
   run-optimizer:
@@ -26,18 +28,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run assignment script
+      - name: Run assignment generator (snapshot + history)
         run: |
-          python assign.py
+          python scripts/generate_latest_assignments.py
 
-      - name: Commit and push results (if changed)
+      - name: Commit results (if changed)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Stage BOTH files (history + latest snapshot)
-          git add latest_assignments.csv assignment_history.csv || true
-
-          # Only commit if something actually changed
-          git diff --staged --quiet || git commit -m "Automated daily assignment update"
+          git add latest_assignments.csv assignment_history.csv
+          git diff --staged --quiet || git commit -m "Automated assignment update"
           git push
