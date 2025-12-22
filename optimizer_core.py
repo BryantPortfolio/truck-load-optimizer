@@ -2,7 +2,6 @@ import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
 from datetime import date, timedelta
 from pathlib import Path
-from pandas.errors import ParserError
 
 # -------------------------
 # Constants (easy to tweak)
@@ -92,17 +91,17 @@ def _coords_to_lat_lon(coords):
 def _calc_fuel_cost(miles):
     if miles is None or pd.isna(miles):
         return None
-    return (float(miles) / MPG) * float(FUEL_PRICE)
+    return (float(miles) / MPG) * FUEL_PRICE
 
 
 def _calc_hours_required(miles):
     if miles is None or pd.isna(miles):
         return None
-    return float(miles) / float(AVG_MPH)
+    return float(miles) / AVG_MPH
 
 
 # ------------------------------
-# Latest snapshot (1 load per driver)
+# Latest snapshot: 1 load per driver (same behavior as before, but richer columns)
 # ------------------------------
 def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
     assignments = []
@@ -129,20 +128,18 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             do_lat, do_lon = _coords_to_lat_lon(dropoff_coords)
 
             fuel_cost = _calc_fuel_cost(best["Miles"])
-            net_profit = float(best["Payout"]) - fuel_cost if fuel_cost is not None else None
+            net_profit = best["Payout"] - fuel_cost if fuel_cost is not None else None
 
             assignments.append({
-                "DriverID": int(driver["DriverID"]),
-                "AssignedLoadID": int(best["LoadID"]),
+                "DriverID": driver["DriverID"],
+                "AssignedLoadID": best["LoadID"],
                 "Origin": best["Origin"],
                 "Destination": best["Destination"],
                 "LoadMiles": float(best["Miles"]),
                 "Payout": float(best["Payout"]),
                 "ToTargetMiles": round(float(best["DistanceToTarget"]), 1),
-                # Keep coords for Streamlit map (optional)
                 "PickupCoords": pickup_coords,
                 "DropoffCoords": dropoff_coords,
-                # Power BI-friendly numeric coords
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
@@ -154,7 +151,7 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]]
         else:
             assignments.append({
-                "DriverID": int(driver["DriverID"]),
+                "DriverID": driver["DriverID"],
                 "AssignedLoadID": None,
                 "Origin": None,
                 "Destination": None,
@@ -175,19 +172,20 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
 
 
 def build_latest_assignments_df():
-    """Single entry point for GitHub Actions / scripts."""
+    """Single entry point for generating latest_assignments.csv."""
     return match_loads_by_destination(drivers, loads, city_coords)
 
 
 # ------------------------------
-# NEW: Multi-load daily history using 11-hour rule
+# History: multi-load per driver per day using 11-hour rule
 # ------------------------------
 def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
     """
-    Per-load history for one assigned_date where each driver can take multiple loads per day
-    up to DAILY_MAX_HOURS. If a load doesn't fit within remaining hours today, assume
-    it completes next day (your rule).
+    Creates a per-load history table for one assigned_date.
+    Each driver can take multiple loads per day up to DAILY_MAX_HOURS.
+    If a load's hours exceed remaining hours today, it is assumed completed next day.
     """
+
     history_rows = []
     available_loads = loads.copy()
 
@@ -196,7 +194,7 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
         day_offset = 0
         seq = 1
 
-        # Driver-level cap across planning horizon using AvailableHours
+        # Total planning cap for the driver across the horizon (AvailableHours)
         driver_total_remaining_hours = float(driver["AvailableHours"])
 
         while driver_total_remaining_hours > 0 and not available_loads.empty:
@@ -207,7 +205,7 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
             if eligible.empty:
                 break
 
-            # Prefer max payout/hour (efficiency), then payout
+            # Prefer best payout efficiency
             eligible["PayoutPerHour"] = eligible["Payout"] / eligible["HoursRequired"]
             best = eligible.sort_values(
                 by=["PayoutPerHour", "Payout"],
@@ -218,22 +216,22 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
             miles = float(best["Miles"])
             payout = float(best["Payout"])
 
-            trip_start = assigned_date + timedelta(days=day_offset)
+            start_date = assigned_date + timedelta(days=day_offset)
 
-            # Your completion assumption
             if hours_req <= remaining_hours_today:
-                trip_end = trip_start
+                end_date = start_date
                 remaining_hours_today -= hours_req
             else:
-                trip_end = trip_start + timedelta(days=1)
+                # Your requested assumption: completes next day
+                end_date = start_date + timedelta(days=1)
                 spill = hours_req - remaining_hours_today
                 day_offset += 1
                 remaining_hours_today = max(float(DAILY_MAX_HOURS) - spill, 0.0)
 
             driver_total_remaining_hours -= hours_req
 
-            pickup_coords = city_coords.get(best["Origin"].strip())
-            dropoff_coords = city_coords.get(best["Destination"].strip())
+            pickup_coords = city_coords.get(str(best["Origin"]).strip())
+            dropoff_coords = city_coords.get(str(best["Destination"]).strip())
             pu_lat, pu_lon = _coords_to_lat_lon(pickup_coords)
             do_lat, do_lon = _coords_to_lat_lon(dropoff_coords)
 
@@ -242,13 +240,13 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
 
             history_rows.append({
                 "AssignedDate": assigned_date.isoformat(),
-                "TripStartDate": trip_start.isoformat(),
-                "TripEndDate": trip_end.isoformat(),
+                "TripStartDate": start_date.isoformat(),
+                "TripEndDate": end_date.isoformat(),
                 "DriverID": int(driver["DriverID"]),
                 "LoadID": int(best["LoadID"]),
                 "LoadSequence": int(seq),
-                "Origin": best["Origin"],
-                "Destination": best["Destination"],
+                "Origin": str(best["Origin"]),
+                "Destination": str(best["Destination"]),
                 "Miles": round(miles, 2),
                 "HoursRequired": round(hours_req, 2),
                 "Payout": round(payout, 2),
@@ -260,11 +258,11 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
                 "DropoffLon": do_lon
             })
 
-            # Remove used load
+            # Remove assigned load
             available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]]
             seq += 1
 
-            # If they used all hours today, go to next day
+            # If day hours are exhausted, roll to next day
             if remaining_hours_today <= 0:
                 day_offset += 1
                 remaining_hours_today = float(DAILY_MAX_HOURS)
@@ -272,39 +270,36 @@ def build_daily_assignment_history(assigned_date: date) -> pd.DataFrame:
     return pd.DataFrame(history_rows)
 
 
-def _safe_read_assignment_history() -> pd.DataFrame:
+def _read_history_csv_safe(path: Path) -> pd.DataFrame:
     """
-    Read assignment_history.csv if valid; otherwise return empty DF.
-    Prevents GitHub Actions from crashing on malformed CSV.
+    Reads assignment_history.csv safely.
+    If the file is missing/empty/malformed (like your ParserError), returns empty df.
     """
-    if not ASSIGNMENT_HISTORY_PATH.exists():
+    if not path.exists():
         return pd.DataFrame()
 
     try:
-        df = pd.read_csv(ASSIGNMENT_HISTORY_PATH)
-        # If someone accidentally created a 1-column file, treat as invalid
-        if df.shape[1] <= 1:
+        # If the file exists but is empty or badly formatted, this can throw ParserError
+        df = pd.read_csv(path)
+        # sanity check: if it has 1 unnamed column only, treat as broken
+        if df.shape[1] <= 1 and any("Unnamed" in c for c in df.columns):
             return pd.DataFrame()
         return df
-    except (ParserError, UnicodeDecodeError):
+    except Exception:
         return pd.DataFrame()
 
 
 def update_assignment_history_csv(assigned_date: date) -> pd.DataFrame:
     """
-    Append today's daily assignment history to assignment_history.csv.
-    Avoid duplicates for the same (AssignedDate, DriverID, LoadID, LoadSequence).
-    If the existing file is malformed, it will be rebuilt.
+    Appends the day's multi-load history to assignment_history.csv.
+    If the existing file is missing or malformed, it will be rebuilt cleanly.
     """
     new_df = build_daily_assignment_history(assigned_date)
 
     if new_df.empty:
-        # Still ensure a file exists for Power BI if you want
-        if not ASSIGNMENT_HISTORY_PATH.exists():
-            new_df.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
         return new_df
 
-    existing = _safe_read_assignment_history()
+    existing = _read_history_csv_safe(ASSIGNMENT_HISTORY_PATH)
 
     if existing.empty:
         combined = new_df
