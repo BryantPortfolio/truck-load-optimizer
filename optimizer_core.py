@@ -7,16 +7,15 @@ from pathlib import Path
 # -------------------------
 # Constants (easy to tweak)
 # -------------------------
-AVG_MPH = 50
-DAILY_MAX_HOURS = 11
+AVG_MPH = 50                     # used to convert miles -> hours
+DAILY_MAX_HOURS = 11             # 11-hour rule
 MPG = 6
 FUEL_PRICE = 4.0
 
-# How strongly to prefer loads that move closer to TargetCity
-TARGET_DISTANCE_WEIGHT = 0.35  # higher = more "family time" bias
-
-# Variety control: prevent a driver from repeating the same route too often
-ROUTE_COOLDOWN_DAYS = 30
+# Backfill defaults
+BACKFILL_DAYS = 365 * 2          # 2 years
+LOADS_PER_DAY = 30               # synthetic load pool size per day
+SEED = 42
 
 ASSIGNMENT_HISTORY_PATH = Path("assignment_history.csv")
 
@@ -37,7 +36,7 @@ drivers = pd.DataFrame({
     "AvailableHours": [40, 38, 45, 36, 42, 39]
 })
 
-# Kept for "latest snapshot" compatibility (your original 11 loads)
+# Base “seed” loads (used for latest snapshot + as inspiration)
 loads = pd.DataFrame({
     "LoadID": [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
     "Origin": [
@@ -67,11 +66,9 @@ city_coords = {
     "Charlotte, NC": [35.2271, -80.8431]
 }
 
-ALL_CITIES = list(city_coords.keys())
-
 
 # ------------------------------
-# Helpers
+# Utilities
 # ------------------------------
 def haversine(coord1, coord2):
     lat1, lon1 = coord1
@@ -83,37 +80,65 @@ def haversine(coord1, coord2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return 3958.8 * c
 
+
 def _coords_to_lat_lon(coords):
     if not coords or not isinstance(coords, (list, tuple)) or len(coords) != 2:
         return None, None
     return coords[0], coords[1]
+
 
 def _calc_fuel_cost(miles):
     if miles is None or pd.isna(miles):
         return None
     return (float(miles) / MPG) * FUEL_PRICE
 
+
 def _calc_hours_required(miles):
     if miles is None or pd.isna(miles):
         return None
     return float(miles) / AVG_MPH
 
-def _distance_city_to_city(city_a, city_b):
-    ca = city_coords.get(city_a)
-    cb = city_coords.get(city_b)
-    if not ca or not cb:
-        return None
-    return haversine(ca, cb)
 
-def _safe_city(city):
-    return city if city in city_coords else None
+def _safe_read_history(path: Path) -> pd.DataFrame:
+    """
+    Reads assignment_history.csv safely.
+    If the file doesn't exist, is empty, or is malformed, returns an empty DF
+    with expected columns.
+    """
+    cols = [
+        "AssignedDate", "TripStartDate", "TripEndDate",
+        "DriverID", "DriverTargetCity",
+        "LoadID", "LoadSequence",
+        "Origin", "Destination",
+        "Miles", "HoursRequired",
+        "Payout", "FuelCost", "NetProfit",
+        "PickupLat", "PickupLon", "DropoffLat", "DropoffLon"
+    ]
 
-def _route_key(origin, destination):
-    return f"{origin}__{destination}"
+    if not path.exists():
+        return pd.DataFrame(columns=cols)
+
+    try:
+        df = pd.read_csv(path)
+        # If it's blank or has 1 weird column, normalize
+        if df.empty or len(df.columns) < 5:
+            return pd.DataFrame(columns=cols)
+        # Ensure all required columns exist
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        return df[cols]
+    except Exception:
+        # Malformed CSV (like your ParserError). Treat as empty.
+        return pd.DataFrame(columns=cols)
+
+
+def _route_key(row) -> str:
+    return f"{row['Origin']}__{row['Destination']}"
 
 
 # ------------------------------
-# Latest snapshot (1-load-per-driver)
+# Latest snapshot (1 load per driver)
 # ------------------------------
 def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
     assignments = []
@@ -121,8 +146,7 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
 
     for _, driver in drivers_df.iterrows():
         max_miles = driver["AvailableHours"] * AVG_MPH
-        target_city = driver["TargetCity"]
-        target_coords = city_coords_dict.get(target_city)
+        target_coords = city_coords_dict.get(driver["TargetCity"])
 
         eligible = available_loads[available_loads["Miles"] <= max_miles].copy()
 
@@ -179,146 +203,165 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
 
     return pd.DataFrame(assignments)
 
+
 def build_latest_assignments_df():
     return match_loads_by_destination(drivers, loads, city_coords)
 
 
 # ------------------------------
-# Synthetic daily loads (for realistic history)
+# Synthetic load generation for history (variety)
 # ------------------------------
-def generate_synthetic_loads_for_day(day: date, n_loads: int, rng: np.random.Generator) -> pd.DataFrame:
+def generate_synthetic_loads(for_date: date, n: int = LOADS_PER_DAY, seed: int = SEED) -> pd.DataFrame:
     """
-    Creates varied loads each day using city pairs + distance-based miles + payout noise.
-    LoadID is unique per day (yyyymmddxxxx).
+    Generates a realistic set of loads for a given day with variety.
+    Miles are based on haversine distance with noise.
+    Payout correlates with miles with noise.
     """
+    rng = np.random.default_rng(int(seed) + int(for_date.toordinal()))
+    cities = list(city_coords.keys())
+
     rows = []
-    # bias some days to have popular destinations (trendable)
-    hotspot_destinations = rng.choice(ALL_CITIES, size=min(3, len(ALL_CITIES)), replace=False)
+    load_id_base = int(for_date.strftime("%y%m%d")) * 1000  # stable-ish unique per date
+    i = 0
 
-    for i in range(n_loads):
-        origin = rng.choice(ALL_CITIES)
-        # 60% chance destination is a "hotspot", else random (trendable but not repetitive)
-        if rng.random() < 0.60:
-            destination = rng.choice(hotspot_destinations)
-        else:
-            destination = rng.choice(ALL_CITIES)
-
-        # ensure not same city
-        tries = 0
-        while destination == origin and tries < 10:
-            destination = rng.choice(ALL_CITIES)
-            tries += 1
-
-        dist = _distance_city_to_city(origin, destination)
-        if dist is None:
+    while len(rows) < n:
+        origin = rng.choice(cities)
+        dest = rng.choice(cities)
+        if dest == origin:
             continue
 
-        # miles ~ distance with noise
-        miles = max(50, int(dist * rng.uniform(0.9, 1.15)))
-        hours = miles / AVG_MPH
+        o_coord = city_coords[origin]
+        d_coord = city_coords[dest]
+        base_miles = haversine(o_coord, d_coord)
 
-        # payout roughly correlated to miles, with randomness
-        base_rate = rng.uniform(1.6, 2.8)  # $/mile-ish
-        payout = int(miles * base_rate * rng.uniform(0.9, 1.2))
+        # keep miles within a reasonable operational range
+        # noise factor + min cap
+        miles = max(120, base_miles * rng.uniform(0.85, 1.15))
+        miles = float(round(miles))
 
-        load_id = int(f"{day.strftime('%Y%m%d')}{i:04d}")
+        # payout: ~ $1.6 to $2.6 per mile + noise
+        rate = rng.uniform(1.6, 2.6)
+        payout = miles * rate + rng.normal(0, 75)
+        payout = float(round(max(400, payout), 0))
 
         rows.append({
-            "LoadID": load_id,
+            "LoadID": load_id_base + i,
             "Origin": origin,
-            "Destination": destination,
+            "Destination": dest,
             "Miles": miles,
-            "Payout": payout,
-            "HoursRequired": round(hours, 2)
+            "Payout": payout
         })
+        i += 1
 
     return pd.DataFrame(rows)
 
 
 # ------------------------------
-# Daily history: multiple loads per driver, 11-hour rule, TargetCity logic, variety rules
+# History: multi-load/day using 11-hour rule + TargetCity logic + anti-repeat
 # ------------------------------
-def build_daily_assignment_history(
-    assigned_date: date,
-    drivers_state: pd.DataFrame,
-    day_loads: pd.DataFrame,
-    route_recent: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_daily_assignment_history(assigned_date: date,
+                                  loads_df: pd.DataFrame,
+                                  drivers_df: pd.DataFrame,
+                                  existing_history: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns:
-      - history_df for this assigned_date
-      - updated drivers_state (CurrentCity updated to last completed destination)
+    For one assigned_date, each driver can take multiple loads per day up to 11 hours.
+    If hours spill beyond remaining hours for the day, TripEndDate becomes next day.
+    Variety: avoid repeating the same origin/destination for the same driver
+            if it appeared in the last ~60 days.
+    TargetCity logic: prefer loads whose Destination moves driver closer to TargetCity
+            (soft preference, not a hard constraint).
     """
     history_rows = []
-    available = day_loads.copy()
+    available_loads = loads_df.copy()
 
-    # ensure required columns exist
-    for col in ["HoursRequired"]:
-        if col not in available.columns:
-            available["HoursRequired"] = available["Miles"].apply(_calc_hours_required)
+    # build recent-route memory per driver (last 60 days)
+    cutoff = assigned_date - timedelta(days=60)
+    recent = existing_history.copy()
+    if not recent.empty:
+        recent["AssignedDate"] = pd.to_datetime(recent["AssignedDate"], errors="coerce")
+        recent = recent[recent["AssignedDate"] >= pd.Timestamp(cutoff)]
+    recent_routes = {}
+    for d in drivers_df["DriverID"].tolist():
+        if recent.empty:
+            recent_routes[int(d)] = set()
+        else:
+            r = recent[recent["DriverID"] == int(d)].copy()
+            recent_routes[int(d)] = set((r["Origin"].astype(str) + "__" + r["Destination"].astype(str)).tolist())
 
-    updated_drivers = drivers_state.copy()
+    # precompute target coords
+    target_coords_by_driver = {
+        int(row["DriverID"]): city_coords.get(row["TargetCity"])
+        for _, row in drivers_df.iterrows()
+    }
 
-    for idx, driver in updated_drivers.iterrows():
+    # add HoursRequired + payout/hour to available_loads
+    available_loads = available_loads.copy()
+    available_loads["HoursRequired"] = available_loads["Miles"].apply(_calc_hours_required)
+    available_loads["PayoutPerHour"] = available_loads["Payout"] / available_loads["HoursRequired"]
+
+    for _, driver in drivers_df.iterrows():
         driver_id = int(driver["DriverID"])
-        target_city = driver["TargetCity"]
-        current_city = driver["CurrentCity"]
+        target_city = str(driver["TargetCity"])
+        target_coord = target_coords_by_driver.get(driver_id)
 
         remaining_hours_today = float(DAILY_MAX_HOURS)
+        day_offset = 0
         seq = 1
 
-        # We'll keep assigning until they run out of day hours or no loads left
-        while remaining_hours_today > 0 and not available.empty:
-            # filter loads that can at least be started today (we allow spill to next day)
-            eligible = available.copy()
-            eligible = eligible[eligible["HoursRequired"] > 0]
+        # cap planning horizon by driver AvailableHours (week-ish capacity)
+        driver_total_remaining_hours = float(driver["AvailableHours"])
 
+        while driver_total_remaining_hours > 0 and not available_loads.empty:
+            # eligible must fit into remaining overall hours
+            eligible = available_loads[available_loads["HoursRequired"] <= driver_total_remaining_hours].copy()
             if eligible.empty:
                 break
 
-            # scoring:
-            # - maximize payout per hour
-            # - prefer loads whose DEST is closer to TargetCity (family time)
-            eligible["PayoutPerHour"] = eligible["Payout"] / eligible["HoursRequired"]
+            # anti-repeat: remove routes the driver has done recently
+            eligible["RouteKey"] = eligible.apply(_route_key, axis=1)
+            eligible = eligible[~eligible["RouteKey"].isin(recent_routes[driver_id])].copy()
 
-            # distance-to-target
-            eligible["DestToTarget"] = eligible["Destination"].apply(
-                lambda d: _distance_city_to_city(d, target_city) if _safe_city(d) and _safe_city(target_city) else 999999
+            # if anti-repeat filtered everything, allow repeats (but still pick best)
+            if eligible.empty:
+                eligible = available_loads[available_loads["HoursRequired"] <= driver_total_remaining_hours].copy()
+                eligible["RouteKey"] = eligible.apply(_route_key, axis=1)
+
+            # TargetCity preference (soft): smaller distance-to-target is better
+            if target_coord:
+                eligible["ToTargetMiles"] = eligible["Destination"].map(
+                    lambda d: haversine(city_coords.get(d, (0, 0)), target_coord)
+                )
+            else:
+                eligible["ToTargetMiles"] = np.nan
+
+            # Score: prioritize payout/hour, then payout; break ties by closer-to-target
+            # We convert ToTargetMiles into a small penalty so high profit still wins.
+            eligible["Score"] = (
+                eligible["PayoutPerHour"] * 1000
+                + eligible["Payout"]
+                - eligible["ToTargetMiles"].fillna(0) * 0.25
             )
 
-            # variety rule: don't repeat same route for driver within cooldown
-            def route_allowed(row):
-                rk = _route_key(row["Origin"], row["Destination"])
-                last_seen = route_recent.get((driver_id, rk))
-                if last_seen is None:
-                    return True
-                return (assigned_date - last_seen).days >= ROUTE_COOLDOWN_DAYS
+            best = eligible.sort_values(by=["Score"], ascending=[False]).iloc[0]
 
-            eligible = eligible[eligible.apply(route_allowed, axis=1)]
-            if eligible.empty:
-                break
-
-            # combined score: payout-per-hour minus normalized distance-to-target
-            # normalize distance roughly to 0-1 scale using a soft divisor
-            eligible["Score"] = eligible["PayoutPerHour"] - (TARGET_DISTANCE_WEIGHT * (eligible["DestToTarget"] / 1000.0))
-
-            best = eligible.sort_values(by=["Score", "Payout"], ascending=[False, False]).iloc[0]
-
-            miles = float(best["Miles"])
             hours_req = float(best["HoursRequired"])
+            miles = float(best["Miles"])
             payout = float(best["Payout"])
 
-            # completion rule you specified:
-            # - if it fits within remaining hours today -> completes same day
-            # - else completes next day
-            trip_start = assigned_date
-            trip_end = assigned_date if hours_req <= remaining_hours_today else (assigned_date + timedelta(days=1))
+            start_date = assigned_date + timedelta(days=day_offset)
+            if hours_req <= remaining_hours_today:
+                end_date = start_date
+                remaining_hours_today -= hours_req
+            else:
+                end_date = start_date + timedelta(days=1)
+                spill = hours_req - remaining_hours_today
+                day_offset += 1
+                remaining_hours_today = max(DAILY_MAX_HOURS - spill, 0)
 
-            # consume hours today
-            remaining_hours_today = max(0.0, remaining_hours_today - hours_req)
+            driver_total_remaining_hours -= hours_req
 
-            pickup_coords = city_coords.get(best["Origin"])
-            dropoff_coords = city_coords.get(best["Destination"])
+            pickup_coords = city_coords.get(str(best["Origin"]).strip())
+            dropoff_coords = city_coords.get(str(best["Destination"]).strip())
             pu_lat, pu_lon = _coords_to_lat_lon(pickup_coords)
             do_lat, do_lon = _coords_to_lat_lon(dropoff_coords)
 
@@ -327,17 +370,17 @@ def build_daily_assignment_history(
 
             history_rows.append({
                 "AssignedDate": assigned_date.isoformat(),
-                "TripStartDate": trip_start.isoformat(),
-                "TripEndDate": trip_end.isoformat(),
+                "TripStartDate": start_date.isoformat(),
+                "TripEndDate": end_date.isoformat(),
                 "DriverID": driver_id,
+                "DriverTargetCity": target_city,
                 "LoadID": int(best["LoadID"]),
                 "LoadSequence": seq,
-                "Origin": best["Origin"],
-                "Destination": best["Destination"],
-                "TargetCity": target_city,
-                "Miles": miles,
+                "Origin": str(best["Origin"]),
+                "Destination": str(best["Destination"]),
+                "Miles": round(miles, 0),
                 "HoursRequired": round(hours_req, 2),
-                "Payout": payout,
+                "Payout": round(payout, 0),
                 "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
                 "NetProfit": round(net_profit, 2) if net_profit is not None else None,
                 "PickupLat": pu_lat,
@@ -346,105 +389,83 @@ def build_daily_assignment_history(
                 "DropoffLon": do_lon
             })
 
-            # mark route last used for this driver
-            rk = _route_key(best["Origin"], best["Destination"])
-            route_recent[(driver_id, rk)] = assigned_date
-
-            # update driver's current city to last destination (for realism)
-            current_city = best["Destination"]
-            updated_drivers.loc[idx, "CurrentCity"] = current_city
+            # record route to prevent reusing for this driver soon
+            recent_routes[driver_id].add(f"{best['Origin']}__{best['Destination']}")
 
             # remove load from pool
-            available = available[available["LoadID"] != best["LoadID"]]
+            available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]].copy()
+
             seq += 1
 
-    return pd.DataFrame(history_rows), updated_drivers
+            if remaining_hours_today <= 0:
+                day_offset += 1
+                remaining_hours_today = float(DAILY_MAX_HOURS)
+
+    return pd.DataFrame(history_rows)
 
 
-def update_assignment_history_csv(assigned_date: date, seed: int = 42) -> pd.DataFrame:
+def update_assignment_history_csv(assigned_date: date,
+                                  loads_per_day: int = LOADS_PER_DAY,
+                                  seed: int = SEED) -> pd.DataFrame:
     """
-    Appends ONE day of generated history to assignment_history.csv.
-    Creates the file if missing.
+    Appends one day's assignments into assignment_history.csv, creating it if needed.
     """
-    rng = np.random.default_rng(seed + int(assigned_date.strftime("%Y%m%d")))
-    day_loads = generate_synthetic_loads_for_day(assigned_date, n_loads=30, rng=rng)
+    existing = _safe_read_history(ASSIGNMENT_HISTORY_PATH)
 
-    # build route memory from existing file (if present)
-    route_recent = {}
-    if ASSIGNMENT_HISTORY_PATH.exists():
-        try:
-            existing = pd.read_csv(ASSIGNMENT_HISTORY_PATH)
-            # store last date each driver used each route
-            existing["AssignedDate"] = pd.to_datetime(existing["AssignedDate"]).dt.date
-            for _, r in existing.iterrows():
-                route_recent[(int(r["DriverID"]), _route_key(r["Origin"], r["Destination"]))] = r["AssignedDate"]
-        except Exception:
-            existing = pd.DataFrame()
-    else:
-        existing = pd.DataFrame()
+    daily_loads = generate_synthetic_loads(for_date=assigned_date, n=loads_per_day, seed=seed)
+    new_df = build_daily_assignment_history(
+        assigned_date=assigned_date,
+        loads_df=daily_loads,
+        drivers_df=drivers,
+        existing_history=existing
+    )
 
-    drivers_state = drivers.copy()
-    new_df, _ = build_daily_assignment_history(assigned_date, drivers_state, day_loads, route_recent)
+    if new_df.empty:
+        return existing
 
-    if existing.empty:
-        combined = new_df
-    else:
-        combined = pd.concat([existing, new_df], ignore_index=True)
+    combined = pd.concat([existing, new_df], ignore_index=True)
 
-        # de-dupe by (AssignedDate, DriverID, LoadID, LoadSequence)
-        combined = combined.drop_duplicates(
-            subset=["AssignedDate", "DriverID", "LoadID", "LoadSequence"],
-            keep="first"
-        )
+    combined = combined.drop_duplicates(
+        subset=["AssignedDate", "DriverID", "LoadID", "LoadSequence"],
+        keep="first"
+    )
 
     combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return combined
 
 
-def backfill_assignment_history(
-    end_date: date,
-    years: int = 2,
-    seed: int = 42
-) -> pd.DataFrame:
+def backfill_assignment_history(end_date: date = None,
+                                days: int = BACKFILL_DAYS,
+                                seed: int = SEED,
+                                loads_per_day: int = LOADS_PER_DAY) -> pd.DataFrame:
     """
-    Creates a realistic multi-year assignment_history.csv (overwrites file).
-    - multiple loads per driver per day
-    - 11-hour rule
-    - TargetCity bias
-    - variety: route cooldown per driver
-
-    end_date: last date to include (inclusive)
-    years: number of years to backfill
+    Backfills assignment_history.csv for `days` ending at `end_date` (default today).
+    Ensures variety via synthetic loads + anti-repeat logic.
     """
-    start_date = end_date - timedelta(days=365 * years)
+    if end_date is None:
+        end_date = date.today()
 
-    rng = np.random.default_rng(seed)
-    route_recent = {}
+    start_date = end_date - timedelta(days=days - 1)
 
-    drivers_state = drivers.copy()
-    all_days = []
+    history = _safe_read_history(ASSIGNMENT_HISTORY_PATH)
 
     d = start_date
     while d <= end_date:
-        # daily loads vary by weekday (more loads midweek)
-        weekday = d.weekday()  # Mon=0..Sun=6
-        base = 28 if weekday in (1, 2, 3) else 22
-        n_loads = int(base + rng.integers(-4, 6))
-
-        day_rng = np.random.default_rng(seed + int(d.strftime("%Y%m%d")))
-        day_loads = generate_synthetic_loads_for_day(d, n_loads=n_loads, rng=day_rng)
-
-        day_history, drivers_state = build_daily_assignment_history(
+        # Each day updates with new synthetic loads; anti-repeat uses prior rows
+        daily_loads = generate_synthetic_loads(for_date=d, n=loads_per_day, seed=seed)
+        new_df = build_daily_assignment_history(
             assigned_date=d,
-            drivers_state=drivers_state,
-            day_loads=day_loads,
-            route_recent=route_recent
+            loads_df=daily_loads,
+            drivers_df=drivers,
+            existing_history=history
         )
-        if not day_history.empty:
-            all_days.append(day_history)
-
+        if not new_df.empty:
+            history = pd.concat([history, new_df], ignore_index=True)
+            history = history.drop_duplicates(
+                subset=["AssignedDate", "DriverID", "LoadID", "LoadSequence"],
+                keep="first"
+            )
         d += timedelta(days=1)
 
-    history = pd.concat(all_days, ignore_index=True) if all_days else pd.DataFrame()
     history.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return history
