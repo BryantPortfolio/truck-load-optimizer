@@ -1,27 +1,30 @@
 import pandas as pd
-import numpy as np
 from math import radians, sin, cos, sqrt, atan2
 from datetime import date, timedelta
 from pathlib import Path
+import random
 
 # -------------------------
-# Constants (easy to tweak)
+# Constants
 # -------------------------
-AVG_MPH = 50                     # used to convert miles -> hours
-DAILY_MAX_HOURS = 11             # 11-hour rule
+AVG_MPH = 50
+DAILY_MAX_HOURS = 11
 MPG = 6
 FUEL_PRICE = 4.0
 
-# Backfill defaults
-BACKFILL_DAYS = 365 * 2          # 2 years
-LOADS_PER_DAY = 30               # synthetic load pool size per day
-SEED = 42
-
 ASSIGNMENT_HISTORY_PATH = Path("assignment_history.csv")
 
+# How many loads exist per day in the simulated market
+DAILY_LOAD_POOL_SIZE = 40
+
+# How strongly we favor loads that end closer to the driver TargetCity
+TARGET_BIAS_WEIGHT = 0.15  # higher = more "must move toward target"
+
+# Penalize repeating same destination for same driver (adds variety)
+DEST_REPEAT_PENALTY = 0.35  # higher = less repetition
 
 # -------------------------
-# Data Setup
+# Base Driver Setup
 # -------------------------
 drivers = pd.DataFrame({
     "DriverID": [1, 2, 3, 4, 5, 6],
@@ -36,110 +39,149 @@ drivers = pd.DataFrame({
     "AvailableHours": [40, 38, 45, 36, 42, 39]
 })
 
-# Base “seed” loads (used for latest snapshot + as inspiration)
-loads = pd.DataFrame({
-    "LoadID": [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
-    "Origin": [
-        "Chicago, IL", "Nashville, TN", "Atlanta, GA", "St. Louis, MO",
-        "Dallas, TX", "Houston, TX", "Memphis, TN", "Orlando, FL",
-        "Chicago, IL", "Atlanta, GA", "Suffolk, VA"
-    ],
-    "Destination": [
-        "Memphis, TN", "Dallas, TX", "Orlando, FL", "Houston, TX",
-        "Atlanta, GA", "St. Louis, MO", "Chicago, IL", "Nashville, TN",
-        "Houston, TX", "Memphis, TN", "Charlotte, NC"
-    ],
-    "Payout": [1000, 1800, 1500, 2000, 1100, 1700, 1600, 1400, 2100, 1250, 1950],
-    "Miles": [500, 800, 600, 950, 550, 870, 780, 690, 990, 560, 880]
-})
-
+# -------------------------
+# Expanded City Coordinates (many states)
+# -------------------------
 city_coords = {
+    # Midwest
     "Chicago, IL": [41.8781, -87.6298],
-    "Memphis, TN": [35.1495, -90.0490],
-    "Nashville, TN": [36.1627, -86.7816],
-    "Dallas, TX": [32.7767, -96.7970],
-    "Atlanta, GA": [33.7490, -84.3880],
-    "Orlando, FL": [28.5383, -81.3792],
     "St. Louis, MO": [38.6270, -90.1994],
+    "Indianapolis, IN": [39.7684, -86.1581],
+    "Columbus, OH": [39.9612, -82.9988],
+    "Detroit, MI": [42.3314, -83.0458],
+    "Minneapolis, MN": [44.9778, -93.2650],
+    "Kansas City, MO": [39.0997, -94.5786],
+
+    # South
+    "Atlanta, GA": [33.7490, -84.3880],
+    "Nashville, TN": [36.1627, -86.7816],
+    "Memphis, TN": [35.1495, -90.0490],
+    "Dallas, TX": [32.7767, -96.7970],
     "Houston, TX": [29.7604, -95.3698],
+    "San Antonio, TX": [29.4241, -98.4936],
+    "New Orleans, LA": [29.9511, -90.0715],
+    "Birmingham, AL": [33.5186, -86.8104],
+    "Charlotte, NC": [35.2271, -80.8431],
+    "Raleigh, NC": [35.7796, -78.6382],
+    "Jacksonville, FL": [30.3322, -81.6557],
+    "Orlando, FL": [28.5383, -81.3792],
+    "Tampa, FL": [27.9506, -82.4572],
+
+    # Mid-Atlantic / Northeast
     "Suffolk, VA": [36.7282, -76.5836],
-    "Charlotte, NC": [35.2271, -80.8431]
+    "Richmond, VA": [37.5407, -77.4360],
+    "Washington, DC": [38.9072, -77.0369],
+    "Baltimore, MD": [39.2904, -76.6122],
+    "Philadelphia, PA": [39.9526, -75.1652],
+    "New York, NY": [40.7128, -74.0060],
+    "Boston, MA": [42.3601, -71.0589],
+
+    # West / Southwest
+    "Denver, CO": [39.7392, -104.9903],
+    "Phoenix, AZ": [33.4484, -112.0740],
+    "Las Vegas, NV": [36.1699, -115.1398],
+    "Los Angeles, CA": [34.0522, -118.2437],
+    "San Francisco, CA": [37.7749, -122.4194],
+    "Seattle, WA": [47.6062, -122.3321],
+    "Portland, OR": [45.5152, -122.6784],
+    "Salt Lake City, UT": [40.7608, -111.8910],
 }
 
+ALL_CITIES = list(city_coords.keys())
 
-# ------------------------------
-# Utilities
-# ------------------------------
+# -------------------------
+# Utility Functions
+# -------------------------
 def haversine(coord1, coord2):
     lat1, lon1 = coord1
     lat2, lon2 = coord2
     rlat1, rlon1, rlat2, rlon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat = rlat2 - rlat1
     dlon = rlon2 - rlon1
-    a = sin(dlat / 2)**2 + cos(rlat1) * cos(rlat2) * sin(dlon / 2)**2
+    a = sin(dlat / 2) ** 2 + cos(rlat1) * cos(rlat2) * sin(dlon / 2) ** 2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return 3958.8 * c
 
+def _calc_hours_required(miles):
+    if miles is None or pd.isna(miles):
+        return None
+    return miles / AVG_MPH
+
+def _calc_fuel_cost(miles):
+    if miles is None or pd.isna(miles):
+        return None
+    return (miles / MPG) * FUEL_PRICE
 
 def _coords_to_lat_lon(coords):
     if not coords or not isinstance(coords, (list, tuple)) or len(coords) != 2:
         return None, None
     return coords[0], coords[1]
 
-
-def _calc_fuel_cost(miles):
-    if miles is None or pd.isna(miles):
-        return None
-    return (float(miles) / MPG) * FUEL_PRICE
-
-
-def _calc_hours_required(miles):
-    if miles is None or pd.isna(miles):
-        return None
-    return float(miles) / AVG_MPH
-
-
-def _safe_read_history(path: Path) -> pd.DataFrame:
-    """
-    Reads assignment_history.csv safely.
-    If the file doesn't exist, is empty, or is malformed, returns an empty DF
-    with expected columns.
-    """
+def _safe_read_history():
+    """Read assignment_history.csv if it exists and is valid; otherwise return empty DF with correct columns."""
     cols = [
         "AssignedDate", "TripStartDate", "TripEndDate",
-        "DriverID", "DriverTargetCity",
-        "LoadID", "LoadSequence",
+        "DriverID", "LoadID", "LoadSequence",
         "Origin", "Destination",
-        "Miles", "HoursRequired",
-        "Payout", "FuelCost", "NetProfit",
+        "Miles", "HoursRequired", "Payout", "FuelCost", "NetProfit",
+        "TargetCity",
         "PickupLat", "PickupLon", "DropoffLat", "DropoffLon"
     ]
 
-    if not path.exists():
+    if not ASSIGNMENT_HISTORY_PATH.exists():
         return pd.DataFrame(columns=cols)
 
     try:
-        df = pd.read_csv(path)
-        # If it's blank or has 1 weird column, normalize
-        if df.empty or len(df.columns) < 5:
+        df = pd.read_csv(ASSIGNMENT_HISTORY_PATH)
+        # If file exists but is empty / malformed, normalize:
+        if df.empty:
             return pd.DataFrame(columns=cols)
-        # Ensure all required columns exist
-        for c in cols:
-            if c not in df.columns:
-                df[c] = None
+        missing = [c for c in cols if c not in df.columns]
+        for c in missing:
+            df[c] = None
         return df[cols]
     except Exception:
-        # Malformed CSV (like your ParserError). Treat as empty.
+        # If your file is currently broken, this prevents Actions from dying.
         return pd.DataFrame(columns=cols)
 
+# -------------------------
+# LOAD POOL GENERATION (this is what adds realism + new states)
+# -------------------------
+def generate_daily_load_pool(assigned_date: date, n_loads: int, rng: random.Random) -> pd.DataFrame:
+    """
+    Generates a daily pool of loads across many states, based on random city pairs.
+    Miles computed via haversine * a realism factor; payout derived from miles with noise.
+    """
+    rows = []
+    realism_factor = 1.18  # road miles > straight line
 
-def _route_key(row) -> str:
-    return f"{row['Origin']}__{row['Destination']}"
+    # Avoid origin == destination
+    for i in range(n_loads):
+        origin = rng.choice(ALL_CITIES)
+        dest = rng.choice(ALL_CITIES)
+        while dest == origin:
+            dest = rng.choice(ALL_CITIES)
 
+        miles = haversine(city_coords[origin], city_coords[dest]) * realism_factor
+        miles = max(60, min(miles, 2200))  # keep within reasonable US load distances
 
-# ------------------------------
-# Latest snapshot (1 load per driver)
-# ------------------------------
+        # payout: base per mile + random premium
+        rpm = rng.uniform(1.6, 2.6)  # $/mile
+        payout = miles * rpm + rng.uniform(50, 350)
+
+        rows.append({
+            "LoadID": int(assigned_date.strftime("%Y%m%d")) * 1000 + i,  # unique per day
+            "Origin": origin,
+            "Destination": dest,
+            "Miles": round(miles, 0),
+            "Payout": round(payout, 0)
+        })
+
+    return pd.DataFrame(rows)
+
+# -------------------------
+# LATEST SNAPSHOT (1 load per driver)
+# -------------------------
 def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
     assignments = []
     available_loads = loads_df.copy()
@@ -168,31 +210,29 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             net_profit = best["Payout"] - fuel_cost if fuel_cost is not None else None
 
             assignments.append({
-                "DriverID": driver["DriverID"],
-                "AssignedLoadID": best["LoadID"],
+                "DriverID": int(driver["DriverID"]),
+                "AssignedLoadID": int(best["LoadID"]),
                 "Origin": best["Origin"],
                 "Destination": best["Destination"],
-                "LoadMiles": best["Miles"],
-                "Payout": best["Payout"],
-                "ToTargetMiles": round(best["DistanceToTarget"], 1),
+                "LoadMiles": float(best["Miles"]),
+                "Payout": float(best["Payout"]),
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
                 "DropoffLon": do_lon,
-                "FuelCost": fuel_cost,
-                "NetProfit": net_profit
+                "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
+                "NetProfit": round(net_profit, 2) if net_profit is not None else None
             })
 
             available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]]
         else:
             assignments.append({
-                "DriverID": driver["DriverID"],
+                "DriverID": int(driver["DriverID"]),
                 "AssignedLoadID": None,
                 "Origin": None,
                 "Destination": None,
                 "LoadMiles": None,
                 "Payout": 0,
-                "ToTargetMiles": None,
                 "PickupLat": None,
                 "PickupLon": None,
                 "DropoffLat": None,
@@ -203,226 +243,165 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
 
     return pd.DataFrame(assignments)
 
-
 def build_latest_assignments_df():
-    return match_loads_by_destination(drivers, loads, city_coords)
-
-
-# ------------------------------
-# Synthetic load generation for history (variety)
-# ------------------------------
-def generate_synthetic_loads(for_date: date, n: int = LOADS_PER_DAY, seed: int = SEED) -> pd.DataFrame:
     """
-    Generates a realistic set of loads for a given day with variety.
-    Miles are based on haversine distance with noise.
-    Payout correlates with miles with noise.
+    Generates a daily load pool (realistic) then assigns 1 load per driver for the snapshot.
+    This makes your 'latest' file look more real too.
     """
-    rng = np.random.default_rng(int(seed) + int(for_date.toordinal()))
-    cities = list(city_coords.keys())
+    rng = random.Random(int(date.today().strftime("%Y%m%d")))
+    daily_pool = generate_daily_load_pool(date.today(), DAILY_LOAD_POOL_SIZE, rng)
+    return match_loads_by_destination(drivers, daily_pool, city_coords)
 
-    rows = []
-    load_id_base = int(for_date.strftime("%y%m%d")) * 1000  # stable-ish unique per date
-    i = 0
-
-    while len(rows) < n:
-        origin = rng.choice(cities)
-        dest = rng.choice(cities)
-        if dest == origin:
-            continue
-
-        o_coord = city_coords[origin]
-        d_coord = city_coords[dest]
-        base_miles = haversine(o_coord, d_coord)
-
-        # keep miles within a reasonable operational range
-        # noise factor + min cap
-        miles = max(120, base_miles * rng.uniform(0.85, 1.15))
-        miles = float(round(miles))
-
-        # payout: ~ $1.6 to $2.6 per mile + noise
-        rate = rng.uniform(1.6, 2.6)
-        payout = miles * rate + rng.normal(0, 75)
-        payout = float(round(max(400, payout), 0))
-
-        rows.append({
-            "LoadID": load_id_base + i,
-            "Origin": origin,
-            "Destination": dest,
-            "Miles": miles,
-            "Payout": payout
-        })
-        i += 1
-
-    return pd.DataFrame(rows)
-
-
-# ------------------------------
-# History: multi-load/day using 11-hour rule + TargetCity logic + anti-repeat
-# ------------------------------
-def build_daily_assignment_history(assigned_date: date,
-                                  loads_df: pd.DataFrame,
-                                  drivers_df: pd.DataFrame,
-                                  existing_history: pd.DataFrame) -> pd.DataFrame:
+# -------------------------
+# HISTORY (multi-load per driver per day using 11-hour rule)
+# -------------------------
+def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = None) -> pd.DataFrame:
     """
-    For one assigned_date, each driver can take multiple loads per day up to 11 hours.
-    If hours spill beyond remaining hours for the day, TripEndDate becomes next day.
-    Variety: avoid repeating the same origin/destination for the same driver
-            if it appeared in the last ~60 days.
-    TargetCity logic: prefer loads whose Destination moves driver closer to TargetCity
-            (soft preference, not a hard constraint).
+    Multi-load per driver per assigned_date, respecting 11-hour daily rule.
+    Completion date:
+      - same day if hours fit within remaining 11 hours
+      - next day if it spills over (your requested assumption)
+    Includes TargetCity logic and variety (penalize same destination repeats).
     """
-    history_rows = []
-    available_loads = loads_df.copy()
+    rng = random.Random(rng_seed if rng_seed is not None else int(assigned_date.strftime("%Y%m%d")))
+    daily_pool = generate_daily_load_pool(assigned_date, DAILY_LOAD_POOL_SIZE, rng)
 
-    # build recent-route memory per driver (last 60 days)
-    cutoff = assigned_date - timedelta(days=60)
-    recent = existing_history.copy()
+    history = _safe_read_history()
+
+    # For variety: track each driver's recent destinations (last ~60 days)
+    recent = history.copy()
     if not recent.empty:
         recent["AssignedDate"] = pd.to_datetime(recent["AssignedDate"], errors="coerce")
-        recent = recent[recent["AssignedDate"] >= pd.Timestamp(cutoff)]
-    recent_routes = {}
-    for d in drivers_df["DriverID"].tolist():
+        cutoff = pd.Timestamp(assigned_date) - pd.Timedelta(days=60)
+        recent = recent[recent["AssignedDate"] >= cutoff]
+
+    driver_recent_dests = {}
+    for d in drivers["DriverID"].tolist():
         if recent.empty:
-            recent_routes[int(d)] = set()
+            driver_recent_dests[int(d)] = set()
         else:
-            r = recent[recent["DriverID"] == int(d)].copy()
-            recent_routes[int(d)] = set((r["Origin"].astype(str) + "__" + r["Destination"].astype(str)).tolist())
+            ddf = recent[recent["DriverID"] == int(d)]
+            driver_recent_dests[int(d)] = set(ddf["Destination"].dropna().tolist())
 
-    # precompute target coords
-    target_coords_by_driver = {
-        int(row["DriverID"]): city_coords.get(row["TargetCity"])
-        for _, row in drivers_df.iterrows()
-    }
+    rows = []
+    available_loads = daily_pool.copy()
 
-    # add HoursRequired + payout/hour to available_loads
-    available_loads = available_loads.copy()
-    available_loads["HoursRequired"] = available_loads["Miles"].apply(_calc_hours_required)
-    available_loads["PayoutPerHour"] = available_loads["Payout"] / available_loads["HoursRequired"]
-
-    for _, driver in drivers_df.iterrows():
+    for _, driver in drivers.iterrows():
         driver_id = int(driver["DriverID"])
-        target_city = str(driver["TargetCity"])
-        target_coord = target_coords_by_driver.get(driver_id)
+        target_city = driver["TargetCity"]
+        target_coords = city_coords.get(target_city)
 
-        remaining_hours_today = float(DAILY_MAX_HOURS)
+        remaining_today = float(DAILY_MAX_HOURS)
         day_offset = 0
         seq = 1
 
-        # cap planning horizon by driver AvailableHours (week-ish capacity)
-        driver_total_remaining_hours = float(driver["AvailableHours"])
+        # total cap across horizon (AvailableHours)
+        driver_total_remaining = float(driver["AvailableHours"])
 
-        while driver_total_remaining_hours > 0 and not available_loads.empty:
-            # eligible must fit into remaining overall hours
-            eligible = available_loads[available_loads["HoursRequired"] <= driver_total_remaining_hours].copy()
-            if eligible.empty:
+        while driver_total_remaining > 0 and not available_loads.empty:
+            tmp = available_loads.copy()
+            tmp["HoursRequired"] = tmp["Miles"].apply(_calc_hours_required)
+
+            # must fit in driver overall remaining
+            tmp = tmp[tmp["HoursRequired"] <= driver_total_remaining]
+            if tmp.empty:
                 break
 
-            # anti-repeat: remove routes the driver has done recently
-            eligible["RouteKey"] = eligible.apply(_route_key, axis=1)
-            eligible = eligible[~eligible["RouteKey"].isin(recent_routes[driver_id])].copy()
+            # scoring:
+            # payout/hour (maximize)
+            tmp["PayoutPerHour"] = tmp["Payout"] / tmp["HoursRequired"]
 
-            # if anti-repeat filtered everything, allow repeats (but still pick best)
-            if eligible.empty:
-                eligible = available_loads[available_loads["HoursRequired"] <= driver_total_remaining_hours].copy()
-                eligible["RouteKey"] = eligible.apply(_route_key, axis=1)
-
-            # TargetCity preference (soft): smaller distance-to-target is better
-            if target_coord:
-                eligible["ToTargetMiles"] = eligible["Destination"].map(
-                    lambda d: haversine(city_coords.get(d, (0, 0)), target_coord)
+            # distance-to-target (minimize) if we have target coords
+            if target_coords:
+                tmp["DistToTarget"] = tmp["Destination"].map(
+                    lambda c: haversine(city_coords.get(c, (0, 0)), target_coords)
                 )
             else:
-                eligible["ToTargetMiles"] = np.nan
+                tmp["DistToTarget"] = 0
 
-            # Score: prioritize payout/hour, then payout; break ties by closer-to-target
-            # We convert ToTargetMiles into a small penalty so high profit still wins.
-            eligible["Score"] = (
-                eligible["PayoutPerHour"] * 1000
-                + eligible["Payout"]
-                - eligible["ToTargetMiles"].fillna(0) * 0.25
+            # repeat penalty: if destination is in driver's recent dests, penalize
+            tmp["RepeatPenalty"] = tmp["Destination"].apply(
+                lambda d: 1 if d in driver_recent_dests.get(driver_id, set()) else 0
             )
 
-            best = eligible.sort_values(by=["Score"], ascending=[False]).iloc[0]
+            # composite score (higher is better)
+            tmp["Score"] = (
+                tmp["PayoutPerHour"]
+                - TARGET_BIAS_WEIGHT * (tmp["DistToTarget"] / 1000.0)
+                - DEST_REPEAT_PENALTY * tmp["RepeatPenalty"]
+            )
+
+            best = tmp.sort_values(by=["Score", "Payout"], ascending=[False, False]).iloc[0]
 
             hours_req = float(best["HoursRequired"])
             miles = float(best["Miles"])
             payout = float(best["Payout"])
 
             start_date = assigned_date + timedelta(days=day_offset)
-            if hours_req <= remaining_hours_today:
+            if hours_req <= remaining_today:
                 end_date = start_date
-                remaining_hours_today -= hours_req
+                remaining_today -= hours_req
             else:
                 end_date = start_date + timedelta(days=1)
-                spill = hours_req - remaining_hours_today
+                spill = hours_req - remaining_today
                 day_offset += 1
-                remaining_hours_today = max(DAILY_MAX_HOURS - spill, 0)
+                remaining_today = max(DAILY_MAX_HOURS - spill, 0)
 
-            driver_total_remaining_hours -= hours_req
+            driver_total_remaining -= hours_req
 
-            pickup_coords = city_coords.get(str(best["Origin"]).strip())
-            dropoff_coords = city_coords.get(str(best["Destination"]).strip())
-            pu_lat, pu_lon = _coords_to_lat_lon(pickup_coords)
-            do_lat, do_lon = _coords_to_lat_lon(dropoff_coords)
+            pu = city_coords.get(best["Origin"])
+            do = city_coords.get(best["Destination"])
+            pu_lat, pu_lon = _coords_to_lat_lon(pu)
+            do_lat, do_lon = _coords_to_lat_lon(do)
 
-            fuel_cost = _calc_fuel_cost(miles)
-            net_profit = payout - fuel_cost if fuel_cost is not None else None
+            fuel = _calc_fuel_cost(miles)
+            net = payout - fuel if fuel is not None else None
 
-            history_rows.append({
+            rows.append({
                 "AssignedDate": assigned_date.isoformat(),
                 "TripStartDate": start_date.isoformat(),
                 "TripEndDate": end_date.isoformat(),
                 "DriverID": driver_id,
-                "DriverTargetCity": target_city,
                 "LoadID": int(best["LoadID"]),
                 "LoadSequence": seq,
-                "Origin": str(best["Origin"]),
-                "Destination": str(best["Destination"]),
+                "Origin": best["Origin"],
+                "Destination": best["Destination"],
                 "Miles": round(miles, 0),
                 "HoursRequired": round(hours_req, 2),
                 "Payout": round(payout, 0),
-                "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
-                "NetProfit": round(net_profit, 2) if net_profit is not None else None,
+                "FuelCost": round(fuel, 2) if fuel is not None else None,
+                "NetProfit": round(net, 2) if net is not None else None,
+                "TargetCity": target_city,
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
                 "DropoffLon": do_lon
             })
 
-            # record route to prevent reusing for this driver soon
-            recent_routes[driver_id].add(f"{best['Origin']}__{best['Destination']}")
+            # update repeat tracking
+            driver_recent_dests.setdefault(driver_id, set()).add(best["Destination"])
 
-            # remove load from pool
-            available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]].copy()
-
+            # remove the chosen load from today's pool
+            available_loads = available_loads[available_loads["LoadID"] != best["LoadID"]]
             seq += 1
 
-            if remaining_hours_today <= 0:
+            if remaining_today <= 0:
                 day_offset += 1
-                remaining_hours_today = float(DAILY_MAX_HOURS)
+                remaining_today = float(DAILY_MAX_HOURS)
 
-    return pd.DataFrame(history_rows)
+    return pd.DataFrame(rows)
 
-
-def update_assignment_history_csv(assigned_date: date,
-                                  loads_per_day: int = LOADS_PER_DAY,
-                                  seed: int = SEED) -> pd.DataFrame:
+def update_assignment_history_csv(assigned_date: date) -> pd.DataFrame:
     """
-    Appends one day's assignments into assignment_history.csv, creating it if needed.
+    Append one day into assignment_history.csv with de-dupe.
+    Creates the file if missing. Safe even if the existing file is malformed.
     """
-    existing = _safe_read_history(ASSIGNMENT_HISTORY_PATH)
-
-    daily_loads = generate_synthetic_loads(for_date=assigned_date, n=loads_per_day, seed=seed)
-    new_df = build_daily_assignment_history(
-        assigned_date=assigned_date,
-        loads_df=daily_loads,
-        drivers_df=drivers,
-        existing_history=existing
-    )
+    new_df = build_daily_assignment_history(assigned_date)
 
     if new_df.empty:
-        return existing
+        return new_df
 
+    existing = _safe_read_history()
     combined = pd.concat([existing, new_df], ignore_index=True)
 
     combined = combined.drop_duplicates(
@@ -433,39 +412,53 @@ def update_assignment_history_csv(assigned_date: date,
     combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return combined
 
-
-def backfill_assignment_history(end_date: date = None,
-                                days: int = BACKFILL_DAYS,
-                                seed: int = SEED,
-                                loads_per_day: int = LOADS_PER_DAY) -> pd.DataFrame:
+# -------------------------
+# One-time 2-year backfill
+# -------------------------
+def backfill_assignment_history_once(years: int = 2) -> pd.DataFrame:
     """
-    Backfills assignment_history.csv for `days` ending at `end_date` (default today).
-    Ensures variety via synthetic loads + anti-repeat logic.
+    Backfills history ONLY ONCE.
+    Rule:
+      - If assignment_history.csv already exists AND already contains data older than the desired start date,
+        do nothing.
+      - Otherwise, backfill missing days.
     """
-    if end_date is None:
-        end_date = date.today()
+    end = date.today()
+    start = end - timedelta(days=365 * years)
 
-    start_date = end_date - timedelta(days=days - 1)
+    existing = _safe_read_history()
 
-    history = _safe_read_history(ASSIGNMENT_HISTORY_PATH)
+    if not existing.empty:
+        existing_dates = pd.to_datetime(existing["AssignedDate"], errors="coerce").dropna()
+        if not existing_dates.empty:
+            min_existing = existing_dates.min().date()
+            # Already backfilled far enough: stop
+            if min_existing <= start:
+                return existing
 
-    d = start_date
-    while d <= end_date:
-        # Each day updates with new synthetic loads; anti-repeat uses prior rows
-        daily_loads = generate_synthetic_loads(for_date=d, n=loads_per_day, seed=seed)
-        new_df = build_daily_assignment_history(
-            assigned_date=d,
-            loads_df=daily_loads,
-            drivers_df=drivers,
-            existing_history=history
-        )
-        if not new_df.empty:
-            history = pd.concat([history, new_df], ignore_index=True)
-            history = history.drop_duplicates(
-                subset=["AssignedDate", "DriverID", "LoadID", "LoadSequence"],
-                keep="first"
-            )
-        d += timedelta(days=1)
+    # Build range to backfill
+    all_days = pd.date_range(start=start, end=end, freq="D")
+    combined = existing.copy()
 
-    history.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
-    return history
+    existing_day_set = set()
+    if not existing.empty:
+        existing_day_set = set(existing["AssignedDate"].dropna().astype(str).tolist())
+
+    for d in all_days:
+        day_str = d.date().isoformat()
+        if day_str in existing_day_set:
+            continue
+
+        day_df = build_daily_assignment_history(d.date(), rng_seed=int(d.strftime("%Y%m%d")))
+        if day_df.empty:
+            continue
+
+        combined = pd.concat([combined, day_df], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=["AssignedDate", "DriverID", "LoadID", "LoadSequence"],
+        keep="first"
+    )
+
+    combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
+    return combined
