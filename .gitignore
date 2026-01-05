@@ -1,0 +1,8 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated data
+assignment_history.csv
+latest_assignments.csv
+.backfill_done
