@@ -216,6 +216,10 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             fuel_cost = _calc_fuel_cost(best["Miles"])
             net_profit = best["Payout"] - fuel_cost if fuel_cost is not None else None
 
+            # ✅ Add back PickupCoords/DropoffCoords for Power BI stability
+            pickup_coords_str = f"{pu_lat},{pu_lon}" if pu_lat is not None and pu_lon is not None else None
+            dropoff_coords_str = f"{do_lat},{do_lon}" if do_lat is not None and do_lon is not None else None
+
             assignments.append({
                 "DriverID": int(driver["DriverID"]),
                 "AssignedLoadID": int(best["LoadID"]),
@@ -223,12 +227,17 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Destination": best["Destination"],
                 "LoadMiles": float(best["Miles"]),
                 "Payout": float(best["Payout"]),
-                "ToTargetMiles": round(float(best["DistanceToTarget"]), 1),  # ✅ restored
+                "ToTargetMiles": round(float(best["DistanceToTarget"]), 1),
                 "TargetCity": target_city,
+
+                # ✅ both formats
+                "PickupCoords": pickup_coords_str,
+                "DropoffCoords": dropoff_coords_str,
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
                 "DropoffLon": do_lon,
+
                 "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
                 "NetProfit": round(net_profit, 2) if net_profit is not None else None
             })
@@ -242,12 +251,17 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Destination": None,
                 "LoadMiles": None,
                 "Payout": 0,
-                "ToTargetMiles": None,  # ✅ restored
+                "ToTargetMiles": None,
                 "TargetCity": target_city,
+
+                # ✅ both formats
+                "PickupCoords": None,
+                "DropoffCoords": None,
                 "PickupLat": None,
                 "PickupLon": None,
                 "DropoffLat": None,
                 "DropoffLon": None,
+
                 "FuelCost": None,
                 "NetProfit": None
             })
@@ -359,7 +373,6 @@ def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = N
             fuel = _calc_fuel_cost(miles)
             net = payout - fuel if fuel is not None else None
 
-            # ✅ DropoffLon explicitly guaranteed in output
             rows.append({
                 "AssignedDate": assigned_date.isoformat(),
                 "TripStartDate": start_date.isoformat(),
