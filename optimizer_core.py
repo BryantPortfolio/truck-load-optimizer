@@ -1,6 +1,6 @@
 import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, time 
 from pathlib import Path
 import random
 
@@ -473,3 +473,70 @@ def backfill_assignment_history_once(years: int = 2) -> pd.DataFrame:
 
     combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return combined
+def _pick_dispatch_datetime(rng: random.Random, dispatch_day: date) -> datetime:
+    """Dispatch time between 6:00 and 10:45 AM."""
+    hour = rng.randint(6, 10)
+    minute = rng.choice([0, 15, 30, 45])
+    return datetime.combine(dispatch_day, time(hour, minute))
+
+def _calc_dwell_hours(rng: random.Random, hours_required: float) -> float:
+    """Simple realism: dwell/stops increase with trip duration."""
+    if hours_required <= 4:
+        return rng.uniform(0.1, 0.4)
+    elif hours_required <= 8:
+        return rng.uniform(0.25, 0.75)
+    else:
+        return rng.uniform(0.5, 1.5)
+def add_dispatch_delivery_timestamps_to_history(force: bool = False) -> pd.DataFrame:
+    """
+    Adds DispatchDateTime and DeliveryDateTime to the existing assignment_history.csv.
+    Uses simple realism and deterministic randomness based on DriverID/LoadID so it’s stable.
+    If the columns already exist and force=False, it does nothing.
+    """
+    if not ASSIGNMENT_HISTORY_PATH.exists():
+        raise FileNotFoundError("assignment_history.csv not found. Generate history first.")
+
+    df = pd.read_csv(ASSIGNMENT_HISTORY_PATH)
+
+    if (not force) and ("DispatchDateTime" in df.columns) and ("DeliveryDateTime" in df.columns):
+        return df
+
+    # Ensure required columns exist
+    needed = {"AssignedDate", "TripStartDate", "TripEndDate", "DriverID", "LoadID", "HoursRequired"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"assignment_history.csv is missing required columns: {missing}")
+
+    dispatch_list = []
+    delivery_list = []
+
+    for _, row in df.iterrows():
+        # deterministic RNG per row
+        seed = int(row["DriverID"]) * 1_000_003 + int(row["LoadID"])
+        rng = random.Random(seed)
+
+        start_date = pd.to_datetime(row["TripStartDate"]).date()
+        end_date = pd.to_datetime(row["TripEndDate"]).date()
+        hrs = float(row["HoursRequired"]) if pd.notna(row["HoursRequired"]) else 0.0
+
+        # dispatch between 6:00–10:45
+        dispatch_dt = _pick_dispatch_datetime(rng, start_date)
+        dwell = _calc_dwell_hours(rng, hrs)
+
+        if end_date == start_date:
+            delivery_dt = dispatch_dt + timedelta(hours=hrs + dwell)
+        else:
+            # resume next day 6:00–8:45
+            resume_hour = rng.randint(6, 8)
+            resume_min = rng.choice([0, 15, 30, 45])
+            resume_dt = datetime.combine(end_date, time(resume_hour, resume_min))
+            delivery_dt = resume_dt + timedelta(hours=hrs + dwell)
+
+        dispatch_list.append(dispatch_dt.isoformat(sep=" "))
+        delivery_list.append(delivery_dt.isoformat(sep=" "))
+
+    df["DispatchDateTime"] = dispatch_list
+    df["DeliveryDateTime"] = delivery_list
+
+    df.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
+    return df
