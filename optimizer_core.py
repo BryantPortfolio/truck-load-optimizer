@@ -1,6 +1,6 @@
 import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
-from datetime import date, timedelta, datetime, time
+from datetime import date, timedelta
 from pathlib import Path
 import random
 
@@ -124,7 +124,6 @@ def _safe_read_history():
     """
     cols = [
         "AssignedDate", "TripStartDate", "TripEndDate",
-        "DispatchDateTime", "DeliveryDateTime",
         "DriverID", "LoadID", "LoadSequence",
         "Origin", "Destination",
         "Miles", "HoursRequired", "Payout", "FuelCost", "NetProfit",
@@ -151,21 +150,6 @@ def _safe_read_history():
     except Exception:
         # If file is broken/malformed, don't blow up your pipeline
         return pd.DataFrame(columns=cols)
-
-def _pick_dispatch_datetime(rng: random.Random, dispatch_day: date) -> datetime:
-    """Random dispatch time between 6:00 and 10:45 AM."""
-    hour = rng.randint(6, 10)
-    minute = rng.choice([0, 15, 30, 45])
-    return datetime.combine(dispatch_day, time(hour, minute))
-
-def _calc_dwell_hours(rng: random.Random, hours_required: float) -> float:
-    """Simple realism: longer loads tend to have more dwell / stop time."""
-    if hours_required <= 4:
-        return rng.uniform(0.1, 0.4)
-    elif hours_required <= 8:
-        return rng.uniform(0.25, 0.75)
-    else:
-        return rng.uniform(0.5, 1.5)
 
 # -------------------------
 # LOAD POOL GENERATION (adds realism + new states)
@@ -232,6 +216,7 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             fuel_cost = _calc_fuel_cost(best["Miles"])
             net_profit = best["Payout"] - fuel_cost if fuel_cost is not None else None
 
+            # ✅ Add back PickupCoords/DropoffCoords for Power BI stability
             pickup_coords_str = f"{pu_lat},{pu_lon}" if pu_lat is not None and pu_lon is not None else None
             dropoff_coords_str = f"{do_lat},{do_lon}" if do_lat is not None and do_lon is not None else None
 
@@ -244,12 +229,15 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Payout": float(best["Payout"]),
                 "ToTargetMiles": round(float(best["DistanceToTarget"]), 1),
                 "TargetCity": target_city,
+
+                # ✅ both formats
                 "PickupCoords": pickup_coords_str,
                 "DropoffCoords": dropoff_coords_str,
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
                 "DropoffLon": do_lon,
+
                 "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
                 "NetProfit": round(net_profit, 2) if net_profit is not None else None
             })
@@ -265,12 +253,15 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Payout": 0,
                 "ToTargetMiles": None,
                 "TargetCity": target_city,
+
+                # ✅ both formats
                 "PickupCoords": None,
                 "DropoffCoords": None,
                 "PickupLat": None,
                 "PickupLon": None,
                 "DropoffLat": None,
                 "DropoffLon": None,
+
                 "FuelCost": None,
                 "NetProfit": None
             })
@@ -295,7 +286,6 @@ def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = N
       - same day if hours fit within remaining 11 hours
       - next day if it spills over
     Includes TargetCity logic and variety (penalize same destination repeats).
-    Adds simple realism timestamps: DispatchDateTime and DeliveryDateTime.
     """
     rng = random.Random(rng_seed if rng_seed is not None else int(assigned_date.strftime("%Y%m%d")))
     daily_pool = generate_daily_load_pool(assigned_date, DAILY_LOAD_POOL_SIZE, rng)
@@ -383,29 +373,10 @@ def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = N
             fuel = _calc_fuel_cost(miles)
             net = payout - fuel if fuel is not None else None
 
-            # -------------------------
-            # Simple realism timestamps
-            # -------------------------
-            dispatch_dt = _pick_dispatch_datetime(rng, start_date)
-            dwell_hours = _calc_dwell_hours(rng, hours_req)
-
-            if end_date == start_date:
-                # finishes same day
-                delivery_dt = dispatch_dt + timedelta(hours=hours_req + dwell_hours)
-            else:
-                # resumes next day early morning
-                resume_hour = rng.randint(6, 8)
-                resume_min = rng.choice([0, 15, 30, 45])
-                resume_dt = datetime.combine(end_date, time(resume_hour, resume_min))
-                # simple: remaining driving + dwell completes on end_date
-                delivery_dt = resume_dt + timedelta(hours=hours_req + dwell_hours)
-
             rows.append({
                 "AssignedDate": assigned_date.isoformat(),
                 "TripStartDate": start_date.isoformat(),
                 "TripEndDate": end_date.isoformat(),
-                "DispatchDateTime": dispatch_dt.isoformat(sep=" "),
-                "DeliveryDateTime": delivery_dt.isoformat(sep=" "),
                 "DriverID": driver_id,
                 "LoadID": int(best["LoadID"]),
                 "LoadSequence": seq,
