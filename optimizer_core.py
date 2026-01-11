@@ -1,6 +1,6 @@
 import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
-from datetime import date, timedelta, datetime, time 
+from datetime import date, timedelta, datetime, time
 from pathlib import Path
 import random
 
@@ -117,13 +117,29 @@ def _coords_to_lat_lon(coords):
         return None, None
     return coords[0], coords[1]
 
+def _pick_dispatch_datetime(rng: random.Random, dispatch_day: date) -> datetime:
+    """Dispatch time between 6:00 and 10:45 AM."""
+    hour = rng.randint(6, 10)
+    minute = rng.choice([0, 15, 30, 45])
+    return datetime.combine(dispatch_day, time(hour, minute))
+
+def _calc_dwell_hours(rng: random.Random, hours_required: float) -> float:
+    """Simple realism: dwell/stops increase with trip duration."""
+    if hours_required <= 4:
+        return rng.uniform(0.1, 0.4)
+    elif hours_required <= 8:
+        return rng.uniform(0.25, 0.75)
+    else:
+        return rng.uniform(0.5, 1.5)
+
 def _safe_read_history():
     """
     Read assignment_history.csv if it exists and is valid; otherwise return empty DF with correct columns.
-    Also ensures DropoffLon exists even if older history files didn't have it.
+    Ensures schema stability (including timestamps).
     """
     cols = [
         "AssignedDate", "TripStartDate", "TripEndDate",
+        "DispatchDateTime", "DeliveryDateTime",
         "DriverID", "LoadID", "LoadSequence",
         "Origin", "Destination",
         "Miles", "HoursRequired", "Payout", "FuelCost", "NetProfit",
@@ -140,7 +156,6 @@ def _safe_read_history():
         if df.empty:
             return pd.DataFrame(columns=cols)
 
-        # Normalize schema (add missing columns)
         for c in cols:
             if c not in df.columns:
                 df[c] = None
@@ -148,17 +163,12 @@ def _safe_read_history():
         return df[cols]
 
     except Exception:
-        # If file is broken/malformed, don't blow up your pipeline
         return pd.DataFrame(columns=cols)
 
 # -------------------------
 # LOAD POOL GENERATION (adds realism + new states)
 # -------------------------
 def generate_daily_load_pool(assigned_date: date, n_loads: int, rng: random.Random) -> pd.DataFrame:
-    """
-    Generates a daily pool of loads across many states, based on random city pairs.
-    Miles computed via haversine * a realism factor; payout derived from miles with noise.
-    """
     rows = []
     realism_factor = 1.18  # road miles > straight line
 
@@ -216,7 +226,6 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
             fuel_cost = _calc_fuel_cost(best["Miles"])
             net_profit = best["Payout"] - fuel_cost if fuel_cost is not None else None
 
-            # ✅ Add back PickupCoords/DropoffCoords for Power BI stability
             pickup_coords_str = f"{pu_lat},{pu_lon}" if pu_lat is not None and pu_lon is not None else None
             dropoff_coords_str = f"{do_lat},{do_lon}" if do_lat is not None and do_lon is not None else None
 
@@ -229,15 +238,12 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Payout": float(best["Payout"]),
                 "ToTargetMiles": round(float(best["DistanceToTarget"]), 1),
                 "TargetCity": target_city,
-
-                # ✅ both formats
                 "PickupCoords": pickup_coords_str,
                 "DropoffCoords": dropoff_coords_str,
                 "PickupLat": pu_lat,
                 "PickupLon": pu_lon,
                 "DropoffLat": do_lat,
                 "DropoffLon": do_lon,
-
                 "FuelCost": round(fuel_cost, 2) if fuel_cost is not None else None,
                 "NetProfit": round(net_profit, 2) if net_profit is not None else None
             })
@@ -253,15 +259,12 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
                 "Payout": 0,
                 "ToTargetMiles": None,
                 "TargetCity": target_city,
-
-                # ✅ both formats
                 "PickupCoords": None,
                 "DropoffCoords": None,
                 "PickupLat": None,
                 "PickupLon": None,
                 "DropoffLat": None,
                 "DropoffLon": None,
-
                 "FuelCost": None,
                 "NetProfit": None
             })
@@ -269,9 +272,6 @@ def match_loads_by_destination(drivers_df, loads_df, city_coords_dict):
     return pd.DataFrame(assignments)
 
 def build_latest_assignments_df():
-    """
-    Generates a daily load pool (realistic) then assigns 1 load per driver for the snapshot.
-    """
     rng = random.Random(int(date.today().strftime("%Y%m%d")))
     daily_pool = generate_daily_load_pool(date.today(), DAILY_LOAD_POOL_SIZE, rng)
     return match_loads_by_destination(drivers, daily_pool, city_coords)
@@ -281,11 +281,7 @@ def build_latest_assignments_df():
 # -------------------------
 def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = None) -> pd.DataFrame:
     """
-    Multi-load per driver per assigned_date, respecting 11-hour daily rule.
-    Completion date:
-      - same day if hours fit within remaining 11 hours
-      - next day if it spills over
-    Includes TargetCity logic and variety (penalize same destination repeats).
+    Generates per-load rows for a day, including DispatchDateTime and DeliveryDateTime.
     """
     rng = random.Random(rng_seed if rng_seed is not None else int(assigned_date.strftime("%Y%m%d")))
     daily_pool = generate_daily_load_pool(assigned_date, DAILY_LOAD_POOL_SIZE, rng)
@@ -373,10 +369,25 @@ def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = N
             fuel = _calc_fuel_cost(miles)
             net = payout - fuel if fuel is not None else None
 
+            # --------- NEW: timestamps generated on every row ---------
+            dispatch_dt = _pick_dispatch_datetime(rng, start_date)
+            dwell = _calc_dwell_hours(rng, hours_req)
+
+            if end_date == start_date:
+                delivery_dt = dispatch_dt + timedelta(hours=hours_req + dwell)
+            else:
+                resume_hour = rng.randint(6, 8)
+                resume_min = rng.choice([0, 15, 30, 45])
+                resume_dt = datetime.combine(end_date, time(resume_hour, resume_min))
+                delivery_dt = resume_dt + timedelta(hours=hours_req + dwell)
+            # ----------------------------------------------------------
+
             rows.append({
                 "AssignedDate": assigned_date.isoformat(),
                 "TripStartDate": start_date.isoformat(),
                 "TripEndDate": end_date.isoformat(),
+                "DispatchDateTime": dispatch_dt.isoformat(sep=" "),
+                "DeliveryDateTime": delivery_dt.isoformat(sep=" "),
                 "DriverID": driver_id,
                 "LoadID": int(best["LoadID"]),
                 "LoadSequence": seq,
@@ -405,10 +416,6 @@ def build_daily_assignment_history(assigned_date: date, rng_seed: int | None = N
     return pd.DataFrame(rows)
 
 def update_assignment_history_csv(assigned_date: date) -> pd.DataFrame:
-    """
-    Append one day into assignment_history.csv with de-dupe.
-    Creates the file if missing. Safe even if the existing file is malformed.
-    """
     new_df = build_daily_assignment_history(assigned_date)
 
     if new_df.empty:
@@ -425,17 +432,7 @@ def update_assignment_history_csv(assigned_date: date) -> pd.DataFrame:
     combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return combined
 
-# -------------------------
-# One-time 2-year backfill
-# -------------------------
 def backfill_assignment_history_once(years: int = 2) -> pd.DataFrame:
-    """
-    Backfills history ONLY ONCE.
-    Rule:
-      - If assignment_history.csv already exists AND already contains data older than the desired start date,
-        do nothing.
-      - Otherwise, backfill missing days.
-    """
     end = date.today()
     start = end - timedelta(days=365 * years)
 
@@ -473,25 +470,10 @@ def backfill_assignment_history_once(years: int = 2) -> pd.DataFrame:
 
     combined.to_csv(ASSIGNMENT_HISTORY_PATH, index=False)
     return combined
-def _pick_dispatch_datetime(rng: random.Random, dispatch_day: date) -> datetime:
-    """Dispatch time between 6:00 and 10:45 AM."""
-    hour = rng.randint(6, 10)
-    minute = rng.choice([0, 15, 30, 45])
-    return datetime.combine(dispatch_day, time(hour, minute))
 
-def _calc_dwell_hours(rng: random.Random, hours_required: float) -> float:
-    """Simple realism: dwell/stops increase with trip duration."""
-    if hours_required <= 4:
-        return rng.uniform(0.1, 0.4)
-    elif hours_required <= 8:
-        return rng.uniform(0.25, 0.75)
-    else:
-        return rng.uniform(0.5, 1.5)
 def add_dispatch_delivery_timestamps_to_history(force: bool = False) -> pd.DataFrame:
     """
-    Adds DispatchDateTime and DeliveryDateTime to the existing assignment_history.csv.
-    Uses simple realism and deterministic randomness based on DriverID/LoadID so it’s stable.
-    If the columns already exist and force=False, it does nothing.
+    One-time retrofit for older files (still useful if you ever need it again).
     """
     if not ASSIGNMENT_HISTORY_PATH.exists():
         raise FileNotFoundError("assignment_history.csv not found. Generate history first.")
@@ -502,32 +484,23 @@ def add_dispatch_delivery_timestamps_to_history(force: bool = False) -> pd.DataF
     if (not force) and ("DispatchDateTime" in df.columns) and ("DeliveryDateTime" in df.columns):
         return df
 
-    # Ensure required columns exist
-    needed = {"AssignedDate", "TripStartDate", "TripEndDate", "DriverID", "LoadID", "HoursRequired"}
-    missing = needed - set(df.columns)
-    if missing:
-        raise ValueError(f"assignment_history.csv is missing required columns: {missing}")
-
     dispatch_list = []
     delivery_list = []
 
     for _, row in df.iterrows():
-        # deterministic RNG per row
-        seed = int(row["DriverID"]) * 1_000_003 + int(row["LoadID"])
+        seed = int(float(row["DriverID"])) * 1_000_003 + int(float(row["LoadID"]))
         rng = random.Random(seed)
 
         start_date = pd.to_datetime(row["TripStartDate"]).date()
         end_date = pd.to_datetime(row["TripEndDate"]).date()
         hrs = float(row["HoursRequired"]) if pd.notna(row["HoursRequired"]) else 0.0
 
-        # dispatch between 6:00–10:45
         dispatch_dt = _pick_dispatch_datetime(rng, start_date)
         dwell = _calc_dwell_hours(rng, hrs)
 
         if end_date == start_date:
             delivery_dt = dispatch_dt + timedelta(hours=hrs + dwell)
         else:
-            # resume next day 6:00–8:45
             resume_hour = rng.randint(6, 8)
             resume_min = rng.choice([0, 15, 30, 45])
             resume_dt = datetime.combine(end_date, time(resume_hour, resume_min))
