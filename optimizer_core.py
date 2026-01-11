@@ -497,6 +497,7 @@ def add_dispatch_delivery_timestamps_to_history(force: bool = False) -> pd.DataF
         raise FileNotFoundError("assignment_history.csv not found. Generate history first.")
 
     df = pd.read_csv(ASSIGNMENT_HISTORY_PATH)
+    df = df.dropna(subset=["DriverID", "LoadID", "HoursRequired"], how="any").copy()
 
     if (not force) and ("DispatchDateTime" in df.columns) and ("DeliveryDateTime" in df.columns):
         return df
