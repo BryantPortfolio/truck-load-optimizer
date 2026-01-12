@@ -35,20 +35,29 @@ The solution models multi-load driver assignments, delivery timelines, on-time p
   - Load distance and payout
     
 ✅ Fuel cost & net profit calculation
+
 ✅ Destination proximity bias toward driver target cities
+
 ✅ Realistic mileage calculations using Haversine distance
+
 ✅ Built with Streamlit (web dashboard) -> transferred to Power BI
 
   ## Time & Performance Modeling Features 
 ✅ Dispatch and delivery timestamps generated with realistic constraints
+
 ✅ End-to-End cycle time calculations in hours
+
 ✅ On-time delivery classfication based on SLA thresholds
+
 ✅ Daily and historical performance tracking
 
   ## Profitability Analysis
 ✅ Fuel cost modeling based on miles, MPG, and fuel price
+
 ✅ Net Profit calculation per load
+
 ✅ Route-level and destination-level profit analysis
+
 ✅ Top-performing destinations by volume and profit
 
 ---
@@ -56,13 +65,21 @@ The solution models multi-load driver assignments, delivery timelines, on-time p
 ## 📊 Technologies Used
 
 - Python 3.x (Pandas, datetime, automation logic)
+  
 - Power BI (DAX, KPI modeling, interactive dashboards)
+  
 - Pandas, NumPy
+  
 - Folium & Haversine for geospatial logic
+  
 - Streamlit for the interactive web dashboard
+  
 - Streamlit-Folium for map embedding
+  
 - GitHub Actions (daily automation)
+  
 - GitHub (version control, portfolio hosting)
+  
 - Excel/CSV (data interchange)
 
 ---
