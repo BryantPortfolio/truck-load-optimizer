@@ -109,14 +109,23 @@ ALL visuals are designed to support operational decision-making
 # Repository Structure 
 truck-load-optimizer/
 │
+
 ├── optimizer_core.py        # Core optimization & simulation logic
+
 ├── scripts/
+
 │   └── generate_latest_assignments.py
+
 ├── assignment_history.csv  # Historical load data (auto-generated)
+
 ├── latest_assignments.csv  # Daily snapshot
+
 ├── .github/workflows/
+
 │   └── assign.yml          # Automation workflow
+
 ├── requirements.txt
+
 └── README.md
 
 ## Notes
