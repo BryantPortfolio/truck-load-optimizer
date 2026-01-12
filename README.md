@@ -134,6 +134,13 @@ truck-load-optimizer/
 
 ## Screenshots
 
+Screenshots from a Power BI dashboard built using automated Python-generated logistics data.
+
+<img width="665" height="377" alt="Truck Load Optimizer (Full Dash)" src="https://github.com/user-attachments/assets/885767a7-85f3-48c7-9374-41bf4afcf99b" />
+
+<img width="592" height="52" alt="Truck Load Optimizer (KPIs)" src="https://github.com/user-attachments/assets/dfd18128-bd25-45c5-a17e-cf14cd9151f6" />
+
+<img width="368" height="137" alt="Truck Load Optimizer (Monthly View)" src="https://github.com/user-attachments/assets/e0a562e5-9b51-4006-aeca-512a9b05a695" />
 
 ## Contact 
 Daijah Bryant
