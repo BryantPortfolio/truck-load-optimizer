@@ -34,8 +34,19 @@ jobs:
 
       - name: Commit results
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add outputs (both files)
           git add latest_assignments.csv assignment_history.csv || true
-          git diff --staged --quiet || git commit -m "Automated daily assignment update"
+
+          # Only commit if something changed
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Automated daily assignment update"
           git push
+
